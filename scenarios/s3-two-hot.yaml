@@ -1,0 +1,30 @@
+name: s3-two-hot
+description: Two hot adapters each needing ~1.15 pods of compute, plus cold adapters. Slots fit; compute does not fit on one pod per hot adapter.
+reference: llm-d-router#3392 follow-up 1a, comment 6218627904 (rate rescaled to this GPU)
+base_check: false  # overloaded by design, so base TTFT is slow on purpose (DESIGN_LLMD_709.md §6.4, check 6)
+pods: 4
+engine: {max_loras: 2, max_cpu_loras: 16, max_lora_rank: 16, max_num_seqs: 256}
+adapters:
+  - {prefix: hot, count: 2, rank: 16}
+  - {prefix: cold, count: 4, rank: 16}
+traffic:
+  # 0.8 of cluster capacity; each hot adapter gets 1.15 x one-pod capacity.
+  rate_c: 3.2
+  duration_s: 180
+  base_share: 0.2
+  output_tokens: 1024
+  prompt_tokens: 64
+  timeout_s: 120
+  steady_after_s: 60
+  classes:
+    - {name: hot, group: hot, share: 0.8984375}
+    - {name: cold, group: cold, share: 0.1015625}
+assumed: [4 cold adapters, max_cpu_loras 16, adapter rank 16, base share 0.2]
+oracle:
+  hot-0: [pod-0, pod-1]
+  hot-1: [pod-2, pod-3]
+  cold-0: [pod-0]
+  cold-1: [pod-1]
+  cold-2: [pod-2]
+  cold-3: [pod-3]
+sim: {capacity_rps: 4.0}

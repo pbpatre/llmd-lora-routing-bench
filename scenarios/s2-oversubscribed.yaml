@@ -1,0 +1,35 @@
+name: s2-oversubscribed
+description: More never-idle adapters than slots. Eight warm adapters hold all 8 slots; no placement frees one without starving a warm adapter.
+reference: llm-d-router#3392 follow-up 1b, comment 6218627904
+pods: 4
+engine: {max_loras: 2, max_cpu_loras: 16, max_lora_rank: 16, max_num_seqs: 256}
+adapters:
+  - {prefix: warm, count: 8, rank: 16}
+  - {prefix: cold, count: 4, rank: 16}
+traffic:
+  rate: 20
+  duration_s: 180
+  base_share: 0.2
+  output_tokens: 1024
+  prompt_tokens: 64
+  timeout_s: 120
+  steady_after_s: 60
+  classes:
+    - {name: warm, group: warm, share: 0.9}
+    - {name: cold, group: cold, share: 0.1}
+assumed: [max_cpu_loras 16, adapter rank 16, base share 0.2, timeout 120 s]
+# Tail pod: pod-3 is kept for cold adapters; two warm adapters double up and pay for it.
+oracle:
+  warm-0: [pod-0]
+  warm-1: [pod-0]
+  warm-2: [pod-1]
+  warm-3: [pod-1]
+  warm-4: [pod-2]
+  warm-5: [pod-2]
+  warm-6: [pod-0]
+  warm-7: [pod-1]
+  cold-0: [pod-3]
+  cold-1: [pod-3]
+  cold-2: [pod-3]
+  cold-3: [pod-3]
+sim: {capacity_rps: 4.0}

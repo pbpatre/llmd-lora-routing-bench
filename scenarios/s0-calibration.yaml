@@ -1,0 +1,26 @@
+name: s0-calibration
+description: One pod. Capacity sweep for one adapter at each output length, and adapter load cost per rank. Not run by `matrix`; run with `python -m lorabench calibrate`.
+reference: llm-d-router#3392 capacity probe (comment 6218627904) and load-cost table (PR body)
+pods: 1
+engine: {max_loras: 1, max_cpu_loras: 2, max_lora_rank: 64, max_num_seqs: 256}
+adapters:
+  - {prefix: cal, count: 1, rank: 16}
+  - {prefix: lc8, count: 5, rank: 8}
+  - {prefix: lc16, count: 5, rank: 16}
+  - {prefix: lc32, count: 5, rank: 32}
+  - {prefix: lc64, count: 5, rank: 64}
+traffic:
+  rate: 1
+  duration_s: 60
+  base_share: 0.0
+  output_tokens: 256
+  steady_after_s: 10
+  classes:
+    - {name: cal, group: cal, share: 1.0}
+sim: {capacity_rps: 4.0}
+calibration:
+  output_tokens: [256, 1024]
+  rates: [1, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48, 64]  # B200 needs the upper end
+  step_duration_s: 60
+  # TTFT knee. An ITL bound (1.3x) was dropped: on B200 it gave 6 req/s at L=1024 while TTFT broke at 16-20.
+  capacity_rule: {ttft_p99_factor: 4.0, completed_fraction: 0.98}

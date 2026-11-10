@@ -1,0 +1,20 @@
+name: s5-zipf
+description: Zipf(1.0) long tail over 32 adapters of mixed rank. One cell of #3392's main grid (8 req/s, CPU tier 4).
+reference: llm-d-router#3392 PR body, main grid
+base_check: false  # storage loads stall every request in a vLLM batch, so base TTFT measures thrash, not overload
+pods: 4
+engine: {max_loras: 4, max_cpu_loras: 4, max_lora_rank: 64, max_num_seqs: 256}
+adapters:
+  - {prefix: z, count: 32, rank: [8, 16, 32, 64]}
+traffic:
+  rate: 8
+  duration_s: 180
+  base_share: 0.2
+  output_tokens: 256
+  prompt_tokens: 64
+  timeout_s: 120
+  steady_after_s: 60
+  classes:
+    - {name: zipf, group: z, share: 1.0, zipf: 1.0}
+assumed: [rank order cycles 8/16/32/64 over popularity order]
+sim: {capacity_rps: 8.0}

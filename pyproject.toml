@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llmd-lora-routing-bench"
+version = "0.1.0"
+description = "Reproducible benchmark for LoRA-aware routing with llm-d-router and vLLM"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+readme = "README.md"
+dependencies = ["aiohttp", "numpy", "pyyaml"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pyflakes"]
+adapters = ["safetensors"]
+
+[tool.setuptools]
+packages = ["lorabench"]
+
+[tool.ruff]
+line-length = 120

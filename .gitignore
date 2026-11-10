@@ -1,0 +1,24 @@
+# Build and tool caches
+.cache/
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Run outputs and logs (results worth keeping go to results/)
+runs*/
+*.log
+*.exit
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local AI-assistant state and private working files
+.claude/
+ai_agent_files/

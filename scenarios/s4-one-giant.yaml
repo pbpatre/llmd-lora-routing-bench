@@ -1,0 +1,28 @@
+name: s4-one-giant
+description: One adapter needing ~2.25 pods of compute plus five cold adapters. Not measured in #3392; the case named on #709.
+reference: new
+base_check: false  # overloaded by design, so base TTFT is slow on purpose (DESIGN_LLMD_709.md §6.4, check 6)
+pods: 4
+engine: {max_loras: 2, max_cpu_loras: 16, max_lora_rank: 16, max_num_seqs: 256}
+adapters:
+  - {prefix: giant, count: 1, rank: 16}
+  - {prefix: cold, count: 5, rank: 16}
+traffic:
+  rate_c: 3.2
+  duration_s: 180
+  base_share: 0.2
+  output_tokens: 1024
+  prompt_tokens: 64
+  timeout_s: 120
+  steady_after_s: 60
+  classes:
+    - {name: giant, group: giant, share: 0.87890625}
+    - {name: cold, group: cold, share: 0.12109375}
+oracle:
+  giant-0: [pod-0, pod-1, pod-2]
+  cold-0: [pod-0]
+  cold-1: [pod-1]
+  cold-2: [pod-2]
+  cold-3: [pod-3]
+  cold-4: [pod-3]
+sim: {capacity_rps: 4.0}
