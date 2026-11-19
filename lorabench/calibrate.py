@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """S0 calibration: one-pod capacity per output length, and adapter load cost per rank.
 
-Capacity C_L is the highest swept rate at which, relative to the lowest rate,
-TTFT p99 stays within a factor and nearly every request completes: the TTFT knee. The full curve is written next to the chosen value.
+Capacity C_L is the highest swept rate at which TTFT p99 stays within a factor of
+its lowest-rate value and nearly every request completes. The full curve is written
+next to it, so another rule can be applied later without re-measuring.
 
 Load cost (vLLM only; the simulator has none): with --max-loras 1 and
 --max-cpu-loras 2, the first request to an adapter pays storage->CPU plus
@@ -44,18 +45,10 @@ def _sweep_step(pod: Pod, sc: Scenario, rate: float, L: int, duration: float, ou
 
 
 def capacity(curve: list[dict], rule: dict) -> float | None:
-    """The highest rate before the first step that breaks the rule, relative to the lowest rate.
-
-    The rule bounds TTFT p99 and the completed share; an ITL bound is optional, because
-    batching raises ITL smoothly long before a pod saturates.
-    """
+    """The highest rate before the first step that breaks `rule`, judged against the lowest rate."""
     base, best = curve[0], None
     for c in curve:
-        if c["ttft_p99"] is None:
-            break
-        itl_factor = rule.get("itl_p50_factor")
-        if (c["ttft_p99"] > rule["ttft_p99_factor"] * base["ttft_p99"]
-                or (itl_factor and c["itl_p50"] > itl_factor * base["itl_p50"])
+        if (c["ttft_p99"] is None or c["ttft_p99"] > rule["ttft_p99_factor"] * base["ttft_p99"]
                 or c["completed_fraction"] < rule["completed_fraction"]):
             break
         best = c["rate"]

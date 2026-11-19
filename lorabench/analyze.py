@@ -33,6 +33,10 @@ Intervals = list[tuple[float, float]]
 Holding = dict[str, dict[str, Intervals]]  # pod -> adapter -> merged slot-holding intervals
 
 SLOW_S = 5.0
+# Gate evaluation (DESIGN_LLMD_709.md §8). A request misses when its TTFT exceeds MISS_S:
+# unloaded TTFT p99 (0.03 s) plus one storage load of a rank-16 adapter (0.43 s), rounded up.
+MISS_S = 0.5
+MIN_ADAPTER_REQUESTS = 20  # fewer and one slow request swings an adapter's miss rate by 5+ points
 LAYOUT_WINDOW_S = 30.0
 HOLDING_SHARE = 0.95  # slot-holding: running on the pod >= 95% of the window
 
@@ -287,6 +291,33 @@ def queue_trend(scrapes: list[dict], pods: list[str], wall_t0: float, start: flo
     return {"per_pod": per_pod, "growing_queue_pods": growing}
 
 
+def misses(reqs: list[dict], threshold: float = MISS_S, min_n: int = MIN_ADAPTER_REQUESTS) -> dict[str, Any]:
+    """Requests with TTFT above `threshold`, overall and per adapter. Timeouts count as misses;
+    errors are excluded (they are a validity failure, not latency). The worst adapter is taken
+    over adapters with at least `min_n` requests, base model excluded."""
+    counted = [(r["adapter"], r["cls"], t) for r in reqs if not math.isnan(t := ttft(r))]
+    per: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # adapter -> [misses, n]
+    per_cls: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    for adapter, cls, t in counted:
+        for d, k in ((per, adapter), (per_cls, cls)):
+            d[k][0] += t > threshold
+            d[k][1] += 1
+    rate = lambda d: {k: {"n": n, "misses": m, "miss_rate": m / n} for k, (m, n) in sorted(d.items())}  # noqa: E731
+    adapters = rate(per)
+    eligible = {a: v for a, v in adapters.items() if a != BASE and v["n"] >= min_n}
+    worst = max(eligible, key=lambda a: eligible[a]["miss_rate"], default=None)
+    total = sum(v["misses"] for v in adapters.values())
+    return {
+        "threshold_s": threshold,
+        "n": len(counted),
+        "misses": total,
+        "miss_rate": total / len(counted) if counted else None,
+        "worst_adapter": {"adapter": worst, **eligible[worst]} if worst else None,
+        "classes": rate(per_cls),
+        "adapters": adapters,
+    }
+
+
 def envoy_overflow(run_dir: Path) -> dict | None:
     """Envoy error counters that moved during the run; None if a stats snapshot is missing."""
     def stat(tag):
@@ -403,6 +434,7 @@ def analyze(run_dir: Path) -> dict[str, Any]:
         out["queue_trend"] = queue_trend(run.scrapes, pods, wall_t0, steady, duration)
     out["activation_proxy"] = activation_proxy(run.scrapes)
     out["activation_proxy_total"] = sum(out["activation_proxy"].values())
+    out["misses"] = misses(st)
     out["validity"] = validity(run, out["full"]["classes"], addr_to_pod)
     return _jsonable(out)
 

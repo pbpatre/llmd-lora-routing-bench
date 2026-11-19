@@ -56,8 +56,12 @@ make calibrate        # S0: one-pod capacity per output length, adapter load cos
 make s1-set CALIBRATION=runs/s0-calibration/<dir>/calibration.json
 make first-set CALIBRATION=...   # S2, S3, S5; with s1-set, the first set (DESIGN_LLMD_709.md §9)
 make report           # per-seed table over runs/
-make gate ARM=<arm>   # #709 gate: needs seeds 4-6 of S1, S2, S3, S4, incl. residency-w4-rr2
+make gate-baselines CALIBRATION=...      # the gate's reference arms, seeds 1-5
+make gate-runs ARM=<arm> SEEDS="1 2" ...  # tune a candidate; then SEEDS="3 4 5" with settings frozen
+make gate ARM=<arm>   # #709 verdict on gate seeds 3-5 (DESIGN_LLMD_709.md §8)
 ```
+
+**Calibrate on the GPU you benchmark.** `make calibrate` measures one pod's capacity C (the highest rate before TTFT p99 jumps) and its unloaded request time at 256 and 1,024 output tokens. S3 and S4 give their rate as `rate_c`, a multiple of C, with class shares solved so that each hot adapter needs 1.15 pods and the giant 2.25. On B200, C₁₀₂₄ = 14 req/s, so S3 runs at 44.8 req/s with 16.1 req/s per hot adapter. S1 and S2 use #3392's fixed rates, so for them calibration feeds only the checks and the feasibility bound. [PRIMER.md §9](PRIMER.md#9-calibration) explains how the loads follow from C.
 
 To run two jobs on one node, give the second its own GPUs, ports and run directory:
 

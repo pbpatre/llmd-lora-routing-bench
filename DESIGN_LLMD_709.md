@@ -1,6 +1,6 @@
 # LoRA routing baseline benchmark: design
 
-**Status:** v2.3, 10 Nov 2026. v2.3 changes, made before any candidate filter ran, are listed under §8 and §12.
+**Status:** v3, 12 Nov 2026. §8 (evaluation) is v3; §12 lists the v2.3 notes. All changes were made before any candidate filter ran.
 
 **Context:** [llm-d/llm-d-router#709](https://github.com/llm-d/llm-d-router/issues/709) (adaptive LoRA placement). This benchmark produces the baselines that a placement filter must beat. The gate proposed on #709: the filter must beat `lora-residency-scorer` (#3392, by atantawi) in at least one mix without losing in the others. §8 makes that rule exact.
 
@@ -79,19 +79,34 @@ Adapters: synthetic fp16, all linear layers, random weights (disclosed), registe
 
 | ID | Regime | Pods × `max_loras` | `max_cpu_loras` | Adapters | Traffic | Replicates |
 | --- | --- | --- | --- | --- | --- | --- |
-| **S0** | calibration | 1 × 1 | 2 | 1 + 20 probes (5 per rank 8/16/32/64) | rate sweep at L = 256 and 1024 → one-pod capacity `C_L` = the highest rate with TTFT p99 ≤ 4× unloaded and ≥ 98% complete (the TTFT knee); load cost storage→CPU and CPU→GPU per rank (caches dropped and warm) | #3392 probes |
+| **S0** | calibration | 1 × 1 | 2 | 1 + 20 probes (5 per rank 8/16/32/64) | rate sweep at L = 256 and 1024 → one-pod capacity `C_L` = the highest rate with TTFT p99 ≤ 4× unloaded and ≥ 98% complete (§12); load cost storage→CPU and CPU→GPU per rank (caches dropped and warm) | #3392 probes |
 | **S1** | partition exists | 4 × 2 | 16 | 2 hot (90% of LoRA) + 4 cold, rank 16* | 12 req/s, L = 256, 180 s | starvation study, comment 6182873062 |
 | **S2** | more never-idle than slots | 4 × 2 | 16* | 8 warm (90%) + 4 cold, rank 16* | 20 req/s, L = 1024 | follow-up 1b, comment 6218627904 |
 | **S3** | two hot adapters at ~1.15 pods each | 4 × 2 | 16* | 2 hot + 4 cold* | 0.8 × 4 × `C_1024` total; hot adapters at 1.15 × `C_1024` each; cold timeout 120 s | follow-up 1a, rate rescaled to our GPU |
 | **S4** | one giant | 4 × 2 | 16 | 1 giant at 2.25 × `C_1024` + 5 cold | ≤ 0.8 of cluster capacity, L = 1024 | **new**: the case named on #709, not yet measured |
 | **S5** | Zipf long tail (cross-check) | 4 × 4 | 4 | 32 adapters, ranks 8/16/32/64, Zipf(1.0) | 8 req/s, L = 256, `--max-lora-rank 64` | one cell of #3392's main grid |
 
-In S2, "cold" is a label carried over from #3392, not a regime: at 0.4 req/s × ~10 s E2E, each cold adapter averages ~4 requests in flight. So all 12 adapters hold slots against 8, and the feasibility bound reports that.
+In S2, "cold" is a label carried over from #3392, not a regime: at 0.4 req/s × 6.0 s unloaded E2E (B200), each cold adapter averages 2.4 requests in flight and is idle about 9% of the time. So all 12 adapters hold slots against 8, and the feasibility bound reports that.
 
 \* These parameters are not stated in the #3392 comments for those studies. They are **assumed**, listed in each scenario's `assumed:` field, and asked about on #709.
 - S1 and S2 keep #3392's absolute mixes, because their regime depends on slots, not GPU speed.
 - S3 and S4 are scaled to our measured `C_1024`.
 - **Deferred** until after the first numbers: the full S5 grid, an 8-pod scale-out, and a second vLLM pin.
+
+**How calibration sets the loads.** Each adapter's rate is its traffic share × the scenario rate. Two calibrated quantities classify it (PRIMER §9.4):
+- **compute load** = rate ÷ `C_L`, in pods: whether one pod keeps up;
+- **requests in flight** = rate × unloaded E2E: at ≥ 3, the adapter is idle < 5% of the time and holds its slot (the feasibility bound's threshold, §7).
+
+S1 and S2 vary only the second, so their absolute rates are kept. S3 and S4 vary the first, so they give `rate_c` and class shares solved for the target pods per adapter: hot share 0.8984375 = 1.15 × 2 ÷ (3.2 × 0.8), giant share 0.87890625 = 2.25 ÷ (3.2 × 0.8). On B200 (`C_256` = 48, `C_1024` = 14, E2E 1.52 s / 6.01 s):
+
+| | rate | per adapter (req/s) | compute (pods) | in flight | holding slots needed / 8 |
+| --- | --- | --- | --- | --- | --- |
+| S1 | 12 | hot 4.3, cold 0.24 | 0.09, 0.005 | 6.6, 0.36 | 2 (fits) |
+| S2 | 20 | warm 1.8, cold 0.40 | 0.13, 0.03 | 10.8, 2.4 | 8 + 4 busy cold (doesn't fit) |
+| S3 | 3.2 × 14 = 44.8 | hot 16.1, cold 0.91 | **1.15**, 0.07 | 97, 5.5 | 2 × 2 + 4 = 8 (exactly) |
+| S4 | 44.8 | giant 31.5, cold 0.87 | **2.25**, 0.06 | 189, 5.2 | 3 + 5 = 8 (exactly) |
+
+In S3 and S4 the cold adapters also hold slots, and slots fill exactly at compute-minimal spread: spreading a hot adapter beyond its compute need displaces a cold one. A hot adapter kept on one pod puts 16.1 req/s there, above `C_1024` and at the start of the 16–20 req/s TTFT cliff, before base and cold traffic are added. `C_1024` = 14 rests on one 60 s step (16 req/s measured 4.1×); C = 16 would raise every S3/S4 rate by 14%.
 
 ## 4. Arms
 
@@ -196,31 +211,55 @@ The load client shards the schedule across 4 processes, with a shared wall-clock
 | reached layout | per 30 s window: does every pod that hosts a non-slot-holding adapter have fewer than `max_loras` slot-holding adapters? |
 | worst adapter | the adapter with the highest TTFT p99. Jain's index was dropped: dividing by a constant doesn't change it, and it was not informative. |
 
-## 8. Statistics and the gate (pre-registered)
+## 8. Evaluation and the gate
 
-**Runs:**
-- 3 seeds per (scenario, arm), paired.
-- **A/A:** `residency-w4` is run twice on every seed in each gate scenario. One copy is at the start of the block and one at the end.
-- **The noise band** for each class's p99 is the larger of:
-  - that class's observed A/A spread;
-  - #3392's replicate spread: 0.70–1.41× for p99, 0.92–1.09× for loads.
-- **p99 differences below 0.25 s never fail a guard or count as a win.** Starvation is measured in seconds; a ratio test on 30 ms latencies flags noise.
-- **Proportions and counts use absolute margins,** not ratios.
+v3, 12 Nov 2026. It was fixed from the baselines, before any candidate filter ran, and is implemented in `compare.py`. It needs agreement on #709 before it judges a filter. Why v1 and v2 were replaced is at the end of this section.
 
-v2.2 widened every band by the largest A/A spread of *any* class. With the bimodal outcomes seen in S2–S4 (§12), that made bands of 0–800×, so v2.3 makes them per class.
+### 8.1 Seeds
 
-**One primary metric per scenario:**
+- **Tuning seeds 1–2.** A candidate's settings (for example how many pods an adapter gets, or the cooldown) may be chosen by looking at these.
+- **Gate seeds 3–5.** The settings are frozen before the candidate runs on them, and the verdict uses only these. The baselines already ran seed 3; that's fine, because what must stay unseen is the candidate's behaviour, not the references'.
+- Every arm replays the same schedule for a seed, so comparisons are paired.
+- **A/A:** `residency-w4` runs twice per seed in S3, S4 and S5. The two copies show how much the metrics move between identical runs.
 
-| Scenario | Primary | Win | Non-inferiority guard |
-| --- | --- | --- | --- |
-| S1 | cold TTFT p99 | not a win target: residency already ≈ 0.2 s | cold p99 ≤ residency × 1.41; cold > 5 s ≤ +1 pp |
-| S2 | cold > 5 s share | ≥ 10 pp lower than residency in every seed | warm > 5 s ≤ +5 pp; total timeouts ≤ residency + 1% of requests |
-| S3 | hot TTFT p99 | non-inferiority only | cold > 5 s ≤ +1 pp; timeouts no higher |
-| S4 | giant TTFT p99 | outside the band in every seed | cold > 5 s ≤ +1 pp |
+### 8.2 Three metrics
 
-**Gate for a placement arm:** a win in at least one of S2 or S4, and every guard holds in every scenario, against each scenario's references: `residency-w4` in S1 and S2, plus `residency-w4-rr2` in S3 and S4, where it runs. Any missing or invalid run for a required (scenario, arm, seed) fails the gate.
+All three come from the steady window of each run (`analyze.misses`). They use one threshold: a request **misses** when its TTFT exceeds **0.5 s**. That is the unloaded TTFT p99 (0.03 s, from S0) plus one storage load of a rank-16 adapter (0.43 s), rounded up. A request that only had to load its adapter is therefore not a miss; one that queued is. Timeouts count as misses; errors invalidate the run instead.
 
-**Tuning is kept separate:** filter parameters (k sizing, cooldown) are tuned on seeds 1–3, and the gate is decided on seeds 4–6.
+| Metric | Definition | What it guards against |
+| --- | --- | --- |
+| **Miss rate** (primary) | Misses ÷ requests, over *all* requests (base model and every adapter), pooled over the gate seeds | A filter that helps one class by hurting another |
+| **Bad seeds** (reliability) | Gate seeds whose miss rate is above 5% | A layout that is good only when early routing happens to go well |
+| **Worst adapter** (fairness) | The highest per-adapter miss rate on any gate seed, counting adapters with ≥ 20 steady-window requests on that seed | A good average that hides one starved adapter |
+
+Per-class p99, per-adapter p90 and p99, adapter loads, blocked-at-arrival and pod imbalance are still reported. They explain results but don't decide them.
+
+### 8.3 Scenario roles and the verdict
+
+The references are `residency-w4` and `residency-w4-rr2`, the best in-tree arms. The candidate is judged against each.
+
+| Scenario | Role | Condition, against each reference |
+| --- | --- | --- |
+| S3 two hot | **win** | pooled miss rate ≥ 2 points lower; no more bad seeds; worst adapter ≤ +5 points |
+| S4 one giant | **win** | same |
+| S1 fits | guard | pooled miss rate ≤ +1 point; worst adapter ≤ +5 points |
+| S5 Zipf | guard | same |
+| S2 oversubscribed | report only | — |
+
+- **The gate passes** only if both S3 and S4 are won and both guards hold.
+- **A missing or invalid run** for any required (scenario, arm, seed) fails the gate.
+- **S2 is not gated.** No layout fits there: 12 adapters need slots most of the time and there are 8. Every arm, the oracle included, starves some adapters. Fixing it needs time-slicing in the engine, which placement can't provide.
+- **Bad seeds are not used in the guards.** S5's normal miss rate is 3–8% at 0.5 s (its adapter loads take 0.26–0.58 s), so its seeds straddle the 5% line by chance.
+
+### 8.4 Why the rules look like this
+
+- **Overloaded scenarios are bimodal.** In S3 and S4, residency-based arms either settle into a balanced layout, with empty queues and about 0.1 s TTFT, or tip one or two pods past capacity for the rest of the run. Which one happens is decided in the first seconds. rr2 tipped on 2 of 5 seeds in both S3 and S4. A per-seed p99 comparison rewards an arm for being lucky, so the gate counts tipped seeds instead.
+- **Per-seed noise is large.** A/A copies of residency differ by up to 15 points of miss rate on the same seed in S3 and S4, against under 1.5 in S1, S2 and S5. So the primary metric is pooled over seeds.
+- **Pooled numbers hide starvation.** S3 `stock` misses only 10% of all requests, yet its four cold adapters miss 100%. Hence the worst-adapter metric.
+- **Per-adapter p99 is too noisy to gate on.** A cold adapter gets 30–60 steady requests per seed, so its p99 is effectively its single worst request. A miss rate over at least 20 requests is steadier.
+- **Limit: three gate seeds are few.** An arm that tips one run in three shows no bad seed in 3 about 30% of the time. The worst-adapter metric partly compensates, because a tipped seed starves specific adapters.
+
+**Replaced rules.** v1 and v2 judged one per-class p99 or > 5 s share per scenario, on seeds 4–6, against a noise band from A/A spread and #3392's 0.70–1.41× replicate band. On the baselines that rule failed the hand-placed oracle even though it was at about 0.1 s on every seed. It required a p99 win against rr2 on every seed, and rr2 was fast on the seeds where it didn't tip. The noise band, the 0.25 s p99 floor and the per-class rules are removed.
 
 ## 9. First credible set
 
@@ -230,6 +269,8 @@ v2.2 widened every band by the largest A/A spread of *any* class. With the bimod
 - **Total:** about 45 runs × ~8 min (180 s of load, up to 120 s of drain, and restart) ≈ 6 GPU-hours, run serially.
 
 **Second set, before any filter code:** S4, `residency-w4-rr2`, and the oracle arm on S2, S3 and S4. If the oracle can't beat residency, report that on #709 before building the filter.
+
+**Gate baselines (done, 11 Nov):** `residency-w4` (with A/A) and `residency-w4-rr2` on seeds 1–5 in S1, S3, S4 and S5, plus the oracle on seeds 1–5 in S3 and S4, and `stock` on S5. `make gate-baselines` reproduces them. With these, only the candidate's own runs remain (`make gate-runs ARM=…`). Results: `results/baseline-v1.md`.
 
 ## 10. Simulator validation
 
@@ -286,6 +327,10 @@ It is part of the default router, and #3392 ran with it, so every arm keeps it. 
 - the residency response-hook check, the EPP plugin-latency bound, and GPU throttle parsing. Each run lists these three under `validity.not_checked`.
 
 **v2.3 notes (10 Nov 2026, from the first GPU baselines, before any candidate filter).**
-- **Capacity is the TTFT knee:** the highest swept rate with TTFT p99 ≤ 4× unloaded and ≥ 98% complete. The v2.2 rule also required ITL p50 ≤ 1.3× unloaded. On B200 that fired at 6 req/s (L = 1024), because batching raises ITL smoothly, while TTFT broke only between 16 and 20 req/s. S3 and S4 scale with this capacity.
+- **Capacity rule.** C is the highest swept rate with TTFT p99 ≤ 4× the lowest-rate value and ≥ 98% complete. Two disclosures:
+  - The v2.2 rule also bounded ITL p50 at 1.3× unloaded. On B200 that fired at 6 req/s (L = 1024), because batching raises ITL smoothly, while TTFT broke only between 16 and 20 req/s.
+  - The factor 4 was chosen after seeing the B200 curve (2× cut where it is still flat). It is a heuristic, and the cut is fragile: 0.124 s against a 0.120 s limit at 16 req/s.
+  - **How it was checked instead:** by the regime it produces, before any candidate ran. At C = 14 req/s, S3's residency arm keeps each hot adapter on 2–3 pods and its hot p99 is 6–13 s in all 6 serial runs, while the oracle, which splits each hot adapter over 2 pods, stays at 0.08–0.09 s. S4's residency giant p99 is 7.3–9.4 s in all 6 runs; the oracle's is 0.09–0.11 s. So each hot adapter does need more than one pod, which is what S3 and S4 test.
+  - A mechanism-based rule (the highest rate at which vLLM's waiting queue stays empty) would be better and GPU-independent. By Little's law, with `max_num_seqs` 256, it would put C nearer 17–18 req/s. It needs the waiting queue recorded during the sweep, which S0 does not do yet. If a later sweep adopts it, S3 and S4 get rescaled and re-run.
 - **Runs are serial.** Two 4-GPU streams running at once on one host made overloaded scenarios measurably worse and noisier: S4 residency giant p99 6.9–17.5 s alongside another stream vs 7.3–9.4 s alone. Every reported baseline is serial.
 - **Overloaded scenarios are bimodal.** In S3 and S4, residency-based arms either settle into a balanced layout (queues stay empty) or tip one or two packed pods past capacity for the rest of the run. Which one happens is decided early. The queue-trend diagnostic shows which, per run.

@@ -183,7 +183,7 @@ Each scenario is built to create **one situation**, so its result has one clear 
 
 **What it does:** sweeps the request rate on a single pod to find its capacity, and measures how long loads and activations take for each adapter rank. See §9.
 
-**What it proves:** nothing about routing. It produces the reference numbers that the other scenarios and checks need.
+**What it proves:** nothing about routing. It produces the reference numbers that set the loads of S3 and S4, and that the checks need (§9.4).
 
 ### S1 "fits": a good layout exists; does the router find it?
 
@@ -206,27 +206,27 @@ No cold adapter ever has to wait behind a hot one.
 
 **Setup:** 8 "warm" adapters (90%) and 4 "cold" ones (10%), 20 req/s, 1,024 output tokens. This replicates #3392's follow-up 1b.
 
-**Why it's interesting:** with long responses, even the "cold" adapters have about 4 requests in flight on average (0.4 req/s × ~10 s per request). So all 12 adapters want a slot nearly all the time, and there are only 8 slots. **No layout fits.** Someone must wait, and no layout can prevent it. Only *time-sharing* can: deliberately letting slots drain so others get a turn.
+**Why it's interesting:** with long responses, even the "cold" adapters have more than 2 requests in flight on average (0.4 req/s × at least 6 s per request, §9.4). So all 12 adapters want a slot nearly all the time, and there are only 8 slots. **No layout fits.** Someone must wait, and no layout can prevent it. Only *time-sharing* can: deliberately letting slots drain so others get a turn.
 
 **What it proves:**
 - **For today's routers:** how badly each fails when no layout fits.
-- **For a new filter:** this is one of two places it can win. The gate's win condition is that the cold > 5 s share drops by at least 10 percentage points against residency, on every gate seed, without hurting warm adapters.
+- **For a new filter:** nothing to win. Any placement just moves the starvation between adapters, so S2 is reported but not part of the gate (§13).
 
 ### S3 "two hot": an adapter too busy for one pod
 
-**Setup:** 2 hot adapters, each needing about 1.15 pods of compute, plus 4 cold ones. The total is 80% of cluster capacity. The rate is set relative to the measured one-pod capacity (`rate_c`). This replicates #3392's follow-up 1a, rescaled to our GPUs.
+**Setup:** 2 hot adapters, each needing about 1.15 pods of compute, plus 4 cold ones. The total is 80% of cluster capacity. The rate is set relative to the measured one-pod capacity (`rate_c`): on B200 that's 44.8 req/s, so 16.1 req/s per hot adapter (§9.4). This replicates #3392's follow-up 1a, rescaled to our GPUs.
 
 **Why it's interesting:** slots are fine, but a hot adapter kept on a single pod overloads that pod. Residency tends to do exactly that.
 
-**What it proves:** whether a router can spread a busy adapter over *just enough* pods. This is a guard scenario, where the new filter must not lose. It's also where `residency-w4-rr2` matters.
+**What it proves:** whether a router can spread a busy adapter over *just enough* pods, reliably. It's one of the two scenarios a new filter must win. It's also where `residency-w4-rr2` matters: it often finds the balanced layout by itself, but not on every seed.
 
 ### S4 "one giant": the case named on #709
 
-**Setup:** 1 "giant" adapter needing about 2.25 pods of compute, plus 5 cold adapters. Not measured in #3392.
+**Setup:** 1 "giant" adapter needing about 2.25 pods of compute, plus 5 cold adapters, at the same 80% of cluster capacity as S3. On B200 the giant gets 31.5 req/s (§9.4). Not measured in #3392.
 
 **Why it's interesting:** the giant must occupy about 3 pods to keep up. But if it's on 3 pods, its requests hold slots on all 3, and the 5 cold adapters must squeeze into what's left. This is the situation that motivates *adaptive* placement: the right number of pods for an adapter depends on its traffic.
 
-**What it proves:** the second place a new filter can win. The win condition is a giant p99 below residency's by more than the noise band, on every gate seed, without hurting the cold adapters.
+**What it proves:** the second scenario a new filter must win: give the giant enough pods without starving the cold adapters behind it.
 
 ### S5 "Zipf": a long tail
 
@@ -234,7 +234,7 @@ No cold adapter ever has to wait behind a hot one.
 
 **Why it's interesting:** this is the most realistic shape, with a few popular adapters and a long tail of rare ones. It's also the only scenario where the CPU tier is smaller than the catalogue, so real storage-to-CPU loads happen.
 
-**What it proves:** a cross-check that the conclusions from the clean scenarios still hold in a messy, realistic mix. It's not part of the gate.
+**What it proves:** that the conclusions from the clean scenarios still hold in a messy, realistic mix. It's a guard: a new filter must not make it worse.
 
 ### Summary
 
@@ -242,10 +242,10 @@ No cold adapter ever has to wait behind a hot one.
 | --- | --- | --- |
 | S0 | one pod, sweep | produces reference numbers |
 | S1 | a layout exists | guard (must not lose) |
-| S2 | no layout exists, too many busy adapters | **win possible** |
-| S3 | one adapter needs more than a pod | guard |
-| S4 | one adapter needs several pods | **win possible** |
-| S5 | realistic long tail | cross-check |
+| S2 | no layout exists, too many busy adapters | report only |
+| S3 | one adapter needs more than a pod | **must win** |
+| S4 | one adapter needs several pods | **must win** |
+| S5 | realistic long tail | guard (must not lose) |
 
 ---
 
@@ -328,30 +328,94 @@ It needs no GPU and starts in a second.
 
 ### 9.1 Why calibrate
 
-Some questions can't be answered without knowing how fast *this* hardware is:
-- **How much traffic is "80% of capacity"?** S3 and S4 are defined that way (`rate_c`), so they mean the same thing on an H100 as on a B200.
-- **How long is a request with no queueing?** The feasibility check (§11) needs this.
-- **What base-model TTFT means "not overloaded"?** A validity check needs it (§12).
+Words like "hot", "cold" and "overloaded" only mean something relative to the hardware. 5 req/s is a heavy load for a slow GPU and nothing for a B200. So before any routing run, calibration measures two facts about **one pod on this GPU**:
+- **its capacity, C**: how many requests per second it can serve before requests start waiting;
+- **the unloaded request time, E2E**: how long one request takes, start to finish, when the pod is idle.
 
-### 9.2 Capacity
+Every load in the later scenarios is set or checked against these two numbers (§9.4). Calibration also measures the **unloaded TTFT**, which a validity check uses (§12), and **load costs** (§9.5).
 
-Calibration (scenario S0) runs a single pod with one adapter. It steps the request rate up: 1, 2, 4, 6, … req/s, for 60 s at each step. Then it applies a fixed rule:
+### 9.2 How capacity is measured
 
-> **Capacity** is the highest rate at which, compared with the lowest rate:
-> - TTFT p99 is at most 2× higher,
-> - the time between tokens (ITL p50) is at most 1.3× higher, and
-> - at least 98% of requests complete.
+Calibration (scenario S0) runs a single pod with one adapter, and sends straight to the pod, with no router in the way. It steps the request rate up through 1, 2, 4, 6, … 64 req/s, for 60 s at each step, and records TTFT and the time between tokens (ITL) at each step. Here's what that looks like on one B200 at 1,024 output tokens:
 
-That rate is the **knee** of the curve: beyond it, latency climbs fast. It's measured separately for 256 and 1,024 output tokens, because longer answers occupy the GPU longer.
+| rate (req/s) | TTFT p99 | ITL p50 | |
+| --- | --- | --- | --- |
+| 1 | 0.030 s | 5.9 ms | the idle baseline |
+| 8 | 0.040 s | 7.7 ms | tokens 30% slower |
+| 14 | 0.072 s | 11.6 ms | still starts fast |
+| 16 | 0.124 s | 12.6 ms | just over 4× the baseline TTFT |
+| 20 | 3.70 s | 13.8 ms | **the cliff**: requests wait to start |
+| 24 | 10.8 s | 13.8 ms | far past it |
 
-### 9.3 Load and activation cost
+The two columns behave differently, and that's the key to reading the curve:
+- **ITL rises gradually.** The more requests a pod runs at once, the more it puts in each decode step, so every token takes a little longer. Nothing breaks.
+- **TTFT stays flat, then jumps.** While the pod has room, a new request starts almost at once. Once it's full, new requests queue, and TTFT goes from a tenth of a second to several seconds within one step. At 1,024 tokens, the jump lines up with vLLM's limit of 256 running sequences (`max_num_seqs`). By Little's law, a pod at 16 req/s × 12.7 s per request runs about 200 at once, which fits. At 20 req/s it would need about 310.
+
+Capacity is defined where the pod *starts making requests wait*:
+
+> **Capacity C** is the highest swept rate at which TTFT p99 is at most 4× its value at the lowest rate, and at least 98% of requests complete.
+
+That point is the **knee** of the curve. The 4× factor is a proxy for the waiting queue, which the sweep doesn't record yet, and it was chosen after seeing the B200 curve. It's fragile here: 16 req/s measured 0.124 s against a 0.120 s limit, and the 256-sequence limit suggests requests really start waiting nearer 17–18 req/s ([DESIGN_LLMD_709.md §12](DESIGN_LLMD_709.md)). It's measured separately at 256 and 1,024 output tokens, because longer answers occupy the GPU longer. On B200, C₂₅₆ = 48 req/s and C₁₀₂₄ = 14 req/s.
+
+### 9.3 Why the knee is defined by TTFT, not ITL
+
+An earlier version of the rule also required ITL to stay within 1.3× of the baseline. On B200 that condition fires at 8 req/s, so C₁₀₂₄ would be 6, even though a pod serves 14 req/s with requests still starting in 0.07 s.
+
+That matters because capacity is the *unit* for the overloaded scenarios (§9.4). If "one pod" meant 6 req/s, an adapter said to "need 1.15 pods" would get 6.9 req/s. One real pod handles that without queueing, so the scenario would claim an overload that never happens, and every router would look fine. With C = 14, the same adapter gets 16.1 req/s. That's right at the cliff, so keeping it on one pod really does cost queueing, which is the case the scenario exists to test.
+
+### 9.4 From C and E2E to hot, cold and giant adapters
+
+An adapter's traffic is just a rate: a share of the scenario's requests. Two quantities derived from that rate decide how it behaves, and calibration supplies one input to each:
+
+| Quantity | Formula | What it decides |
+| --- | --- | --- |
+| **compute load**, in pods | rate ÷ C | whether one pod can keep up with the adapter, or it needs several |
+| **requests in flight** | rate × E2E | whether the adapter ever lets go of its slot |
+
+The second one needs a word of explanation. A slot is held while the adapter has *any* request running on that pod (§1). If an adapter averages n requests in flight, random arrivals leave it with none in flight only about e⁻ⁿ of the time. At n = 3, that's about 5%, so the adapter effectively holds its slot permanently. The feasibility bound (§11) uses the same threshold.
+
+So "hot" and "cold" can mean two different things: heavy on compute, or never letting go of a slot. The scenarios use both. Here are the per-adapter numbers on B200 (C₂₅₆ = 48, C₁₀₂₄ = 14, E2E = 1.52 s at 256 tokens and 6.01 s at 1,024):
+
+| Scenario | How its rate is set | Adapter | Rate (req/s) | Compute (pods) | In flight | Holds a slot? |
+| --- | --- | --- | --- | --- | --- | --- |
+| S1 | fixed: 12 req/s | hot (×2) | 4.3 | 0.09 | 6.6 | yes |
+| | | cold (×4) | 0.24 | 0.005 | 0.36 | no, idle ~70% of the time |
+| S2 | fixed: 20 req/s | warm (×8) | 1.8 | 0.13 | 10.8 | yes |
+| | | cold (×4) | 0.40 | 0.03 | 2.4 | mostly, idle ~9% |
+| S3 | `rate_c: 3.2` → 3.2 × 14 = 44.8 req/s | hot (×2) | 16.1 | **1.15** | 97 | yes |
+| | | cold (×4) | 0.91 | 0.07 | 5.5 | yes |
+| S4 | `rate_c: 3.2` → 44.8 req/s | giant (×1) | 31.5 | **2.25** | 189 | yes |
+| | | cold (×5) | 0.87 | 0.06 | 5.2 | yes |
+
+Reading the table:
+- **S1 and S2 are about slots only.** Compute is tiny (the whole pool needs 0.25 and 1.43 pods of 4), so their rates are fixed, copied from #3392, and don't depend on C.
+  - In S1, the hot adapters hold 2 slots and the cold ones are mostly idle: a good layout exists.
+  - In S2, 8 warm adapters hold all 8 slots, and the cold ones are busy too: no layout fits.
+- **S3 and S4 are about compute.** Their rate is written as `rate_c`, a multiple of C, so the same file means "1.15 pods" on any GPU. The class shares are solved for the target: 0.8984375 = 1.15 × 2 ÷ (3.2 × 0.8), where 0.8 is the non-base share, and the giant's 0.87890625 = 2.25 ÷ 2.56. The pool as a whole is at 3.2 of 4 pods, 80% busy, so compute fits in total but not on one pod per hot adapter.
+- **In S3 and S4, the cold adapters also hold slots,** because at 1,024 tokens each request lasts about 6 s. The adapter counts make the slots come out exactly:
+  - S3: 2 hot adapters × 2 pods each + 4 cold = 8 slots;
+  - S4: the giant on 3 pods + 5 cold = 8 slots.
+
+  There is no spare slot. A router that spreads a hot adapter over more pods than its compute needs must push a cold adapter out.
+
+E2E here is the *unloaded* time. Under load requests take longer, so the in-flight counts above are lower bounds.
+
+### 9.5 Load and activation cost
 
 With `--max-loras 1 --max-cpu-loras 2`, the pod can hold one adapter in a slot and two in CPU memory. Then:
 - **First request to a new adapter:** pays load plus activation.
 - **Second request:** pays nothing extra, because the adapter is already in the slot. The difference between the two is the **load cost**.
 - **Alternating between two adapters already in CPU memory:** each switch pays an activation only. The difference is the **activation cost**.
 
-Each measurement is repeated per rank (8, 16, 32, 64), and the results go into `calibration.json`.
+Each measurement is repeated per rank (8, 16, 32, 64). On B200, an activation costs about 12 ms at every rank, and a load from storage 0.26–0.58 s. These numbers don't set any load. They explain results: when cold requests wait *seconds* while an activation costs 12 ms, the wait is queueing for a slot, not loading.
+
+### 9.6 What calibration doesn't settle
+
+- **C₁₀₂₄ = 14 rests on one 60 s step.** At 16 req/s, TTFT was 4.1× the baseline, just over the line. A rerun that lands under it would make C = 16 and every S3 and S4 rate 14% higher.
+- **It's measured with one adapter and no base traffic.** Mixed batches of several adapters are somewhat slower, so a real pod in S3 likely saturates a little below C.
+- **At 1,024 tokens, C partly reflects `max_num_seqs = 256`,** a configuration value rather than a property of the GPU. Change it, and calibrate again.
+
+All of the outputs go into `calibration.json`. Runs read it with `--calibration`.
 
 ---
 
@@ -449,29 +513,47 @@ Checks not automated yet are listed in each run's `validity.not_checked`, so the
 
 ## 13. Statistics and the gate
 
-### 13.1 Why one run isn't enough
+### 13.1 One question: was the request served promptly?
 
-Run the same arm twice on the same schedule and the p99 differs a little, because of timing jitter, GPU clocks and thread scheduling. Before claiming arm X beats arm Y, you need to know how big that noise is.
+On B200 an unloaded request gets its first token in about 0.03 s. Loading an adapter from storage adds about 0.43 s (rank 16). Anything slower than that means the request **queued**: it waited for a GPU slot or a free pod. So the benchmark asks one yes/no question of every request:
 
-- **Seeds:** each comparison uses 3 seeds (3 different schedules). A win must hold on **every** seed, not on average.
-- **A/A runs:** on every seed, `residency-w4` runs twice, once at the start of the seed's block and once at the end. The difference between the two copies is measured noise.
-- **The noise band** for p99 is the wider of the A/A spread and #3392's own replicate spread (0.70×–1.41×). A p99 "win" must fall outside this band.
-- **Shares and counts** (such as "% over 5 s") use fixed absolute margins instead, such as "at least 10 percentage points".
+> **Did its first token arrive within 0.5 s?** If not, it's a **miss**. A timeout is a miss too.
 
-### 13.2 Pre-registration
+Counting misses is steadier than a percentile. Requests here come in two groups, served in about 0.1 s or stuck for seconds, and a p99 just reports which group the 99th request happened to fall in.
 
-The rules are written into code (`compare.py`, `GATE`) **before** any candidate filter exists. Three habits keep the process honest:
-1. **Tuning seeds and gate seeds are separate.** The filter's parameters may be tuned on seeds 1–3. The verdict uses only seeds 4–6, which the tuning never saw.
+### 13.2 Three numbers per arm
+
+| Metric | Question it answers |
+| --- | --- |
+| **Miss rate** | Of *all* requests (base model and every adapter), what share missed? |
+| **Bad seeds** | On how many seeds did more than 5% of requests miss? |
+| **Worst adapter** | What share of the worst-off adapter's requests missed? (Adapters with at least 20 requests.) |
+
+Each catches a different way to look good while being bad:
+- **Miss rate** catches helping one adapter by hurting another.
+- **Bad seeds** catches luck. In S3 and S4 the early seconds of routing decide whether a run settles into a good layout or tips one pod past capacity. `residency-w4-rr2` tipped on 2 of 5 seeds in both. An arm that's perfect on 2 seeds and broken on the third isn't as good as one that's fine on all three, even if their averages match.
+- **Worst adapter** catches starvation that averages hide. S3's `stock` arm misses only 10% of all requests, yet its four cold adapters miss 100%.
+
+### 13.3 Seeds and noise
+
+Run the same arm twice on the same schedule (an **A/A** pair) and the results differ, from timing jitter and thread scheduling. In S3 and S4 the miss rate differs by up to 15 points between A/A copies, because a run can tip either way. So:
+- results are **pooled over several seeds**, never judged on one;
+- every arm replays the same schedule per seed, so arms are compared like for like.
+
+### 13.4 Pre-registration
+
+The rules are written into code (`compare.py`) **before** any candidate filter exists. Three habits keep the process honest:
+1. **Tuning seeds and gate seeds are separate.** A filter's settings may be tuned on seeds 1–2, then frozen. The verdict uses only seeds 3–5, which the filter never ran on while being tuned.
 2. **Missing or invalid runs fail the gate.** They're never skipped.
 3. **The verdict is mechanical.** `make gate ARM=…` prints pass or fail with every comparison shown.
 
-### 13.3 The gate
+### 13.5 The gate
 
-A candidate arm passes if:
-- it **wins** in S2 (cold > 5 s share at least 10 pp below residency) **or** in S4 (giant p99 below residency by more than the noise band), on every gate seed;
-- **and** it **loses nowhere**: every guard holds in S1, S2, S3 and S4. The guards are "cold p99 no worse than the band", "warm or cold > 5 s share at most 1–5 pp worse", and "timeouts no higher".
+A candidate passes if, against both `residency-w4` and `residency-w4-rr2`:
+- **it wins S3 and S4.** In each: a miss rate at least 2 points lower, no more bad seeds, and a worst adapter no more than 5 points worse;
+- **and it doesn't lose in S1 or S5.** Miss rate at most 1 point higher, and a worst adapter at most 5 points worse.
 
-The comparison is against `residency-w4`, and also against `residency-w4-rr2` in S3 and S4.
+S2 is reported but not gated, because no layout can serve it (§6). On the baselines, the hand-written oracle placement wins S3 and S4 against both references with a 0% miss rate on all five seeds. So the gate can be passed, and passing it means something real.
 
 ---
 
@@ -516,15 +598,18 @@ This example is also why S1 is a *guard* and not a *win* scenario. Residency alr
 | blocked at arrival | a request reaching a pod whose slots are all held by other adapters |
 | calibration | measuring one pod's capacity and load costs on this hardware |
 | closed / open loop | waiting for answers before sending, versus sending on schedule |
+| compute load | an adapter's rate ÷ C: how many pods' worth of GPU time it needs |
 | coordinated omission | the under-measurement caused by closed-loop testing |
 | EPP | Endpoint Picker: the llm-d component that picks a pod per request |
 | Envoy, ext_proc | the proxy carrying requests, and its side channel for asking the EPP |
 | feasibility bound | an offline answer to "could any placement fit this traffic?" |
 | file discovery | the EPP reading the pod list from a file instead of the Kubernetes API |
 | gate | the pre-registered rule a new filter must pass |
-| knee | the rate past which latency rises sharply; it defines capacity |
+| in flight | an adapter's rate × E2E: its average number of running requests; 3 or more means it never releases its slot |
+| knee | the rate past which requests start waiting and TTFT jumps; it defines capacity C |
 | load | moving an adapter from storage into CPU memory |
-| noise band | how much a metric moves between identical runs |
+| miss | a request whose first token took longer than 0.5 s, or timed out |
+| A/A pair | the same arm run twice on the same seed, to measure noise |
 | oracle | a hand-written placement, used to estimate how much better routing could do |
 | p99 | the latency that 99% of requests beat |
 | pod | one engine process with its own GPU |

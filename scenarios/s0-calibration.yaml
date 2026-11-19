@@ -22,5 +22,5 @@ calibration:
   output_tokens: [256, 1024]
   rates: [1, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48, 64]  # B200 needs the upper end
   step_duration_s: 60
-  # TTFT knee. An ITL bound (1.3x) was dropped: on B200 it gave 6 req/s at L=1024 while TTFT broke at 16-20.
+  # Highest rate with TTFT p99 <= 4x the lowest-rate value (DESIGN_LLMD_709.md §12, calibration).
   capacity_rule: {ttft_p99_factor: 4.0, completed_fraction: 0.98}

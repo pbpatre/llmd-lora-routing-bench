@@ -72,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--backend", choices=["sim", "vllm"], help="required when RUNS holds both")
     p.add_argument("--gate", metavar="ARM", help="evaluate the #709 gate for this candidate arm")
     p.add_argument("--seeds", type=int, nargs="+", default=list(compare.GATE_SEEDS),
-                   help="gate seeds; the pre-registered verdict uses the default 4 5 6")
+                   help="gate seeds; the verdict uses the default 3 4 5 (1 2 are for tuning)")
 
     a = ap.parse_args(argv)
     # SIGTERM/SIGHUP (tmux kill, a dropped SSH session) must still run the cleanup that stops the pods.

@@ -10,7 +10,7 @@ VLLM = $(ENGINE) $(if $(CALIBRATION),--calibration $(CALIBRATION))
 S1_ARMS = stock stock-noprefix affinity-w2 residency-w4
 ARMS = stock affinity-w2 residency-w4
 
-.PHONY: test smoke-sim gpu-smoke quick-s1 calibrate s1-set first-set second-set report gate
+.PHONY: test smoke-sim gpu-smoke quick-s1 calibrate s1-set first-set second-set gate-baselines gate-runs report gate
 
 test:
 	$(PY) -m pytest -q -p no:cacheprovider tests
@@ -67,6 +67,22 @@ second-set:
 	$(PY) -m lorabench matrix scenarios/s2-oversubscribed.yaml --arms oracle \
 	  --seeds $(SEEDS) $(VLLM) --runs $(RUNS) --keep-going
 	$(PY) -m lorabench report $(RUNS) --backend vllm
+
+# The gate's reference arms on every seed (DESIGN_LLMD_709.md §8): residency-w4 (with A/A) and
+# residency-w4-rr2 in S1, S3, S4, S5, plus the oracle in S3 and S4. Needs CALIBRATION.
+ALL_SEEDS = 1 2 3 4 5
+gate-baselines:
+	@test -n "$(CALIBRATION)" || { echo "set CALIBRATION=path/to/calibration.json"; exit 1; }
+	$(PY) -m lorabench matrix scenarios/s3-two-hot.yaml scenarios/s4-one-giant.yaml \
+	  --arms residency-w4 residency-w4-rr2 oracle --seeds $(ALL_SEEDS) --aa $(VLLM) --runs $(RUNS) --keep-going
+	$(PY) -m lorabench matrix scenarios/s1-fits.yaml scenarios/s5-zipf.yaml \
+	  --arms residency-w4 residency-w4-rr2 --seeds $(ALL_SEEDS) $(VLLM) --runs $(RUNS) --keep-going
+
+# A candidate arm on the gate scenarios. Tune with SEEDS="1 2"; freeze its settings; then SEEDS="3 4 5".
+gate-runs:
+	@test -n "$(ARM)" -a -n "$(CALIBRATION)" || { echo "set ARM=<candidate arm> CALIBRATION=..."; exit 1; }
+	$(PY) -m lorabench matrix scenarios/s3-two-hot.yaml scenarios/s4-one-giant.yaml scenarios/s1-fits.yaml \
+	  scenarios/s5-zipf.yaml --arms $(ARM) --seeds $(SEEDS) $(VLLM) --runs $(RUNS) --keep-going
 
 report:
 	$(PY) -m lorabench report $(RUNS) --backend vllm

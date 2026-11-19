@@ -299,101 +299,94 @@ def test_percentile_nearest_rank_with_censoring():
 
 # ------------------------------------------------------------------ gate
 
-def _summary(sc, arm, seed, classes, rep=0, valid=True, backend="vllm"):
+def test_misses_counts_timeouts_and_skips_small_adapters():
+    reqs = _starvation_reqs()  # hot-0/1/2 fast; cold-0 waits 7 s; cold-1 fast; cold-2 times out
+    m = analyze.misses(reqs, threshold=0.5, min_n=1)
+    assert (m["n"], m["misses"]) == (6, 2) and m["miss_rate"] == pytest.approx(1 / 3)
+    assert m["classes"]["cold"]["miss_rate"] == pytest.approx(2 / 3)
+    assert m["worst_adapter"]["miss_rate"] == 1.0
+    assert analyze.misses(reqs, threshold=0.5, min_n=20)["worst_adapter"] is None  # every adapter has 1 request
+
+
+def _summary(sc, arm, seed, misses=0, n=1000, worst=0.0, rep=0, valid=True, backend="vllm", classes=None):
     return {"run_id": f"{sc}-{arm}-{seed}-{rep}", "scenario": sc, "arm": arm, "seed": seed, "replicate": rep,
-            "valid": valid, "backend": backend,
-            "validity": {"valid": valid}, "blocked_at_arrival": {}, "steady": {"classes": classes}}
+            "valid": valid, "backend": backend, "validity": {"valid": valid}, "blocked_at_arrival": {},
+            "steady": {"classes": classes or {}},
+            "misses": {"n": n, "misses": misses, "miss_rate": misses / n,
+                       "worst_adapter": {"adapter": "a", "miss_rate": worst}, "classes": {}, "adapters": {}}}
 
 
-def _cls(p99=1.0, over=0.0, n=100, timeouts=0):
-    return {"ttft_p99": p99, "share_over_5s": over, "n": n, "timeouts": timeouts}
-
-
-def _gate_runs(cand_s3_cold_over, cand_s3_warm_over=0.10, cand_giant_p99=2.0):
+def _gate_runs(cand=None, ref=None):
+    """Seeds 3-5 for every gate scenario. `cand` / `ref` map scenario -> per-seed (misses per 1000, worst)."""
+    cand, ref = cand or {}, ref or {}
+    good, tipped = (0, 0.0), (300, 0.6)
     runs = []
-    for s in (4, 5, 6):
-        arms_ = (("residency-w4", (0.80, 0.08), 2.0), ("residency-w4-rr2", None, 2.0),
-                 ("cand", (cand_s3_cold_over, cand_s3_warm_over), cand_giant_p99))
-        for arm, s3, giant in arms_:
-            if s3 is not None:
-                runs.append(_summary("s1-fits", arm, s, {"cold": _cls(0.2), "hot": _cls(0.05)}))
-                runs.append(_summary("s2-oversubscribed", arm, s,
-                                     {"cold": _cls(over=s3[0]), "warm": _cls(over=s3[1]), "base": _cls()}))
-            runs.append(_summary("s3-two-hot", arm, s, {"hot": _cls(0.3), "cold": _cls(), "base": _cls()}))
-            runs.append(_summary("s4-one-giant", arm, s, {"giant": _cls(giant), "cold": _cls()}))
+    for sc in compare.GATE:
+        default_ref = [tipped, good, tipped] if compare.GATE[sc] == "win" else [good] * 3
+        for arm, per in (("cand", cand.get(sc, [good] * 3)),
+                         ("residency-w4", ref.get(sc, default_ref)), ("residency-w4-rr2", ref.get(sc, default_ref))):
+            for seed, (k, w) in zip(compare.GATE_SEEDS, per):
+                runs.append(_summary(sc, arm, seed, misses=k, worst=w))
     return runs
 
 
-def test_gate_passes_on_clear_s3_win():
-    rep = compare.gate(_gate_runs(cand_s3_cold_over=0.30), "cand")
-    assert rep["scenarios"]["s2-oversubscribed"]["win"]["won"] is True
+def test_gate_passes_when_the_candidate_never_tips():
+    rep = compare.gate(_gate_runs(), "cand")
     assert rep["passes"] is True
+    s3 = rep["scenarios"]["s3-two-hot"]
+    assert s3["metrics"]["residency-w4"]["bad_seeds"] == 2 and s3["metrics"]["cand"]["bad_seeds"] == 0
 
 
-def test_gate_fails_when_win_costs_warm_adapters():
-    rep = compare.gate(_gate_runs(cand_s3_cold_over=0.30, cand_s3_warm_over=0.20), "cand")
+def test_gate_needs_wins_in_both_s3_and_s4():
+    ref_good = {"s4-one-giant": [(0, 0.0)] * 3}  # nothing to win in S4
+    assert compare.gate(_gate_runs(ref=ref_good), "cand")["passes"] is False
+
+
+def test_gate_fails_on_more_bad_seeds_even_with_a_lower_mean():
+    # Candidate: 6% on one seed (tipped), 0 elsewhere -> 2.0% pooled.
+    # Reference: 4.5% on every seed (never over the 5% line) -> 4.5% pooled.
+    rep = compare.gate(_gate_runs(cand={"s3-two-hot": [(60, 0.3), (0, 0.0), (0, 0.0)]},
+                                  ref={"s3-two-hot": [(45, 0.3)] * 3}), "cand")
+    vs = rep["scenarios"]["s3-two-hot"]["vs"]["residency-w4"]
+    assert vs["miss_rate"] is True and vs["bad_seeds"] is False and rep["passes"] is False
+
+
+def test_gate_fairness_guard_catches_a_starved_adapter():
+    # S1 guard: overall miss rate unchanged, but one adapter starves.
+    rep = compare.gate(_gate_runs(cand={"s1-fits": [(5, 0.4), (0, 0.0), (0, 0.0)]}), "cand")
+    assert rep["scenarios"]["s1-fits"]["vs"]["residency-w4"] == {"miss_rate": True, "fairness": False}
     assert rep["passes"] is False
 
 
-def test_gate_fails_without_win_or_with_missing_data():
-    assert compare.gate(_gate_runs(cand_s3_cold_over=0.75), "cand")["passes"] is False
-    runs = [r for r in _gate_runs(0.30) if not (r["scenario"] == "s4-one-giant" and r["arm"] == "cand")]
-    assert compare.gate(runs, "cand")["passes"] is False
+def test_gate_guard_allows_its_margin():
+    within = compare.gate(_gate_runs(cand={"s5-zipf": [(10, 0.0)] * 3}), "cand")   # +1.0 point
+    beyond = compare.gate(_gate_runs(cand={"s5-zipf": [(11, 0.0)] * 3}), "cand")   # +1.1 points
+    assert within["passes"] is True and beyond["passes"] is False
 
 
-def test_gate_fails_when_one_seed_is_invalid():
-    runs = _gate_runs(0.30)
-    for r in runs:
-        if r["scenario"] == "s2-oversubscribed" and r["arm"] == "cand" and r["seed"] == 5:
-            r["valid"] = False
-    assert compare.gate(runs, "cand")["passes"] is False
-
-
-def test_gate_s5_win_needs_rr2_present():
-    runs = [r for r in _gate_runs(0.75, cand_giant_p99=0.5)
-            if not (r["scenario"] == "s4-one-giant" and r["arm"] == "residency-w4-rr2")]
+def test_gate_fails_on_missing_or_invalid_runs():
+    runs = [r for r in _gate_runs() if not (r["scenario"] == "s4-one-giant" and r["arm"] == "residency-w4-rr2")]
     rep = compare.gate(runs, "cand")
-    assert rep["scenarios"]["s4-one-giant"]["missing_or_invalid"]
-    assert rep["passes"] is False
-    assert compare.gate(_gate_runs(0.75, cand_giant_p99=0.5), "cand")["passes"] is True
+    assert rep["scenarios"]["s4-one-giant"]["missing_or_invalid"] and rep["passes"] is False
+    runs = _gate_runs()
+    next(r for r in runs if r["arm"] == "cand" and r["seed"] == 4)["valid"] = False
+    assert compare.gate(runs, "cand")["passes"] is False
 
 
 def test_gate_ignores_tuning_seeds():
-    runs = [dict(r, seed=r["seed"] - 3) for r in _gate_runs(0.30)]  # seeds 1-3 only
+    runs = [dict(r, seed=r["seed"] - 2) for r in _gate_runs()]  # seeds 1-3 only
     assert compare.gate(runs, "cand")["passes"] is False
 
 
 def test_report_refuses_mixed_backends():
-    runs = [_summary("s1-fits", "stock", 1, {}, backend="sim"), _summary("s1-fits", "stock", 1, {})]
+    runs = [_summary("s1-fits", "stock", 1, backend="sim"), _summary("s1-fits", "stock", 1)]
     with pytest.raises(ValueError):
         compare.one_backend(runs, None)
     assert len(compare.one_backend(runs, "sim")) == 1
 
 
-def test_noise_band_widens_with_aa_spread():
-    runs = [_summary("s1-fits", "residency-w4", 1, {"cold": _cls(1.0)}),
-            _summary("s1-fits", "residency-w4", 1, {"cold": _cls(2.0)}, rep=1)]
-    idx = compare.valid_index(runs)
-    lo, hi = compare.noise_band(idx, "s1-fits", "cold")
-    assert hi == pytest.approx(2.0) and lo == pytest.approx(0.5)
-    assert compare.noise_band(idx, "s1-fits", "hot") == compare.P99_BAND_3392  # no A/A data for that class
-
-
-def test_gate_timeouts_guard_allows_its_margin():
-    # S2 allows the candidate 1% of the steady requests in extra timeouts (n = 100 per class here).
-    def s3_runs(extra):
-        runs = _gate_runs(cand_s3_cold_over=0.30)
-        for r in runs:
-            if r["scenario"] == "s2-oversubscribed" and r["arm"] == "cand":
-                r["steady"]["classes"]["cold"]["timeouts"] = extra
-        return runs
-    guard = lambda rep: next(g for g in rep["scenarios"]["s2-oversubscribed"]["guards"] if g["metric"] == "timeouts")
-    assert guard(compare.gate(s3_runs(3), "cand"))["ok"] is True    # 3 <= 0 + 1% of 300
-    assert guard(compare.gate(s3_runs(4), "cand"))["ok"] is False
-
-
 def test_duplicate_valid_runs_are_an_error():
-    runs = [_summary("s1-fits", "stock", 1, {}), _summary("s1-fits", "stock", 1, {})]
+    runs = [_summary("s1-fits", "stock", 1), _summary("s1-fits", "stock", 1)]
     with pytest.raises(ValueError, match="two valid runs"):
         compare.valid_index(runs)
     runs[0]["valid"] = False  # an invalid run and its valid re-run are fine
@@ -434,16 +427,8 @@ def test_capacity_is_the_ttft_knee():
              for r, t, i in [(1, 0.030, 0.0059), (8, 0.040, 0.0077), (14, 0.072, 0.0116),
                              (16, 0.124, 0.0126), (20, 3.7, 0.0138)]]
     assert calibrate.capacity(curve, {"ttft_p99_factor": 4.0, "completed_fraction": 0.98}) == 14
-    assert calibrate.capacity(curve, {"ttft_p99_factor": 4.0, "itl_p50_factor": 1.3,
-                                      "completed_fraction": 0.98}) == 1
-
-
-def test_p99_rules_ignore_differences_below_the_floor():
-    band = (0.7, 1.41)
-    assert compare._check("ratio_max", 0.07, 0.03, None, band, 0) is True     # +40 ms is not a regression
-    assert compare._check("ratio_max", 0.60, 0.30, None, band, 0) is False    # 2x and +0.3 s is
-    assert compare._check("ratio_lower", 0.02, 0.10, None, band, 0) is False  # 5x faster but only 80 ms
-    assert compare._check("ratio_lower", 0.2, 12.0, None, band, 0) is True
+    curve[2]["completed_fraction"] = 0.9  # dropped requests end the sweep too
+    assert calibrate.capacity(curve, {"ttft_p99_factor": 4.0, "completed_fraction": 0.98}) == 8
 
 
 def test_queue_trend_flags_a_pod_that_never_drains():
